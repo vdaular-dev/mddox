@@ -1,0 +1,111 @@
+name: Version Project
+
+on:
+  workflow_dispatch:
+    inputs:
+      increment:
+        description: increment settings 1.0.0.0=azzz 0.1.0.0=azz 0.0.1.0=az 0.0.0.1=a
+        required: true
+        default: azz
+        type: string
+      postfix:
+        description: Enter postfix string like rc or beta for pre-release or beta version
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require a branch run
+        if: ${{ github.ref_type != 'branch' }}
+        run: |
+          echo "::error::Run this workflow from the branch that should receive the version commit" >&2
+          exit 1
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.x
+            9.x
+            10.x
+
+      - name: Fetch version from version.win
+        id: version
+        env:
+          INCREMENT: ${{ inputs.increment }}
+          POSTFIX: ${{ inputs.postfix }}
+          VERSION_WIN_API_KEY: ${{ secrets.VERSION_WIN_API_KEY }}
+          VERSION_WIN_PROJECT_ID: ${{ secrets.VERSION_WIN_PROJECT_ID }}
+        run: |
+          VERSION_URL="https://api.version.win/v/${VERSION_WIN_PROJECT_ID}/new?key=${VERSION_WIN_API_KEY}&increment=${INCREMENT}"
+
+          if [ -n "$POSTFIX" ]; then
+            VERSION_URL="${VERSION_URL}&postfix=${POSTFIX}"
+          fi
+
+          if ! VERSION=$(curl -sf "$VERSION_URL"); then
+            echo "::error::Failed to fetch version from version.win" >&2
+            exit 1
+          fi
+
+          BASE_VERSION="${VERSION%%-*}"
+          if [[ "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ASSEMBLY_VERSION="${BASE_VERSION}.0"
+          elif [[ "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ASSEMBLY_VERSION="$BASE_VERSION"
+          else
+            echo "::error::Version '$VERSION' does not start with a three-part or four-part numeric version" >&2
+            exit 1
+          fi
+
+          echo "project=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "assembly=$ASSEMBLY_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Project version: $VERSION"
+          echo "Assembly and file version: $ASSEMBLY_VERSION"
+
+      - name: Install dotnet-property
+        run: dotnet tool install --global dotnet-property
+
+      - name: Apply project version
+        env:
+          PROJECT_VERSION: ${{ steps.version.outputs.project }}
+          ASSEMBLY_VERSION: ${{ steps.version.outputs.assembly }}
+        run: |
+          "$HOME/.dotnet/tools/dotnet-property" mddox.csproj "Version:$PROJECT_VERSION"
+          "$HOME/.dotnet/tools/dotnet-property" mddox.csproj "AssemblyVersion:$ASSEMBLY_VERSION"
+          "$HOME/.dotnet/tools/dotnet-property" mddox.csproj "FileVersion:$ASSEMBLY_VERSION"
+        working-directory: src
+
+      - name: Commit and tag version
+        env:
+          PROJECT_VERSION: ${{ steps.version.outputs.project }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$PROJECT_VERSION" >/dev/null; then
+            echo "::error::Tag '$PROJECT_VERSION' already exists on origin" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/mddox.csproj
+
+          if git diff --cached --quiet; then
+            echo "::error::Version update did not change src/mddox.csproj" >&2
+            exit 1
+          fi
+
+          git commit -m "Set version $PROJECT_VERSION"
+          git tag "$PROJECT_VERSION"
+          git push --atomic origin "HEAD:$TARGET_BRANCH" "refs/tags/$PROJECT_VERSION"
